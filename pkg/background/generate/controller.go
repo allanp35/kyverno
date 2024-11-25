@@ -58,6 +58,7 @@ type GenerateController struct {
 	log logr.Logger
 	jp  jmespath.Interface
 
+	reportsConfig  reportutils.ReportingConfiguration
 	reportsBreaker breaker.Breaker
 }
 
@@ -75,6 +76,7 @@ func NewGenerateController(
 	eventGen event.Interface,
 	log logr.Logger,
 	jp jmespath.Interface,
+	reportsConfig reportutils.ReportingConfiguration,
 	reportsBreaker breaker.Breaker,
 ) *GenerateController {
 	c := GenerateController{
@@ -90,6 +92,7 @@ func NewGenerateController(
 		eventGen:       eventGen,
 		log:            log,
 		jp:             jp,
+		reportsConfig:  reportsConfig,
 		reportsBreaker: reportsBreaker,
 	}
 	return &c
@@ -190,7 +193,7 @@ func (c *GenerateController) getTriggerForCreateOperation(spec kyvernov2.UpdateR
 				c.log.Error(err, "failed to extract resources from admission review request")
 				return nil, err
 			}
-			trigger = &newResource
+			return &newResource, nil
 		}
 	}
 	return trigger, err
@@ -233,11 +236,6 @@ func (c *GenerateController) applyGenerate(trigger unstructured.Unstructured, ur
 		logger.V(4).Info(doesNotApply)
 		return nil, errors.New(doesNotApply)
 	}
-	if c.needsReports(trigger) {
-		if err := c.createReports(context.TODO(), policyContext.NewResource(), engineResponse); err != nil {
-			c.log.Error(err, "failed to create report")
-		}
-	}
 
 	var applicableRules []string
 	for _, r := range engineResponse.PolicyResponse.Rules {
@@ -247,16 +245,39 @@ func (c *GenerateController) applyGenerate(trigger unstructured.Unstructured, ur
 	}
 
 	// Apply the generate rule on resource
-	genResources, err := c.ApplyGeneratePolicy(logger, policyContext, applicableRules)
-	if err == nil {
-		for _, res := range genResources {
-			e := event.NewResourceGenerationEvent(ur.Spec.Policy, ur.Spec.RuleContext[i].Rule, event.GeneratePolicyController, res)
-			c.eventGen.Add(e)
-		}
-
-		e := event.NewBackgroundSuccessEvent(event.GeneratePolicyController, policy, genResources)
-		c.eventGen.Add(e...)
+	genResourcesMap, err := c.ApplyGeneratePolicy(logger, policyContext, applicableRules)
+	if err != nil {
+		return nil, err
 	}
+
+	for i, v := range engineResponse.PolicyResponse.Rules {
+		if resources, ok := genResourcesMap[v.Name()]; ok {
+			unstResources, err := c.GetUnstrResources(resources)
+			if err != nil {
+				c.log.Error(err, "failed to get unst resource names report")
+			}
+			engineResponse.PolicyResponse.Rules[i] = *v.WithGeneratedResources(unstResources)
+		}
+	}
+
+	if c.needsReports(trigger) {
+		if err := c.createReports(context.TODO(), policyContext.NewResource(), engineResponse); err != nil {
+			c.log.Error(err, "failed to create report")
+		}
+	}
+
+	genResources := make([]kyvernov1.ResourceSpec, 0)
+	for _, v := range genResourcesMap {
+		genResources = append(genResources, v...)
+	}
+
+	for _, res := range genResources {
+		e := event.NewResourceGenerationEvent(ur.Spec.Policy, ur.Spec.RuleContext[i].Rule, event.GeneratePolicyController, res)
+		c.eventGen.Add(e)
+	}
+
+	e := event.NewBackgroundSuccessEvent(event.GeneratePolicyController, policy, genResources)
+	c.eventGen.Add(e...)
 
 	return genResources, err
 }
@@ -282,7 +303,8 @@ func (c *GenerateController) getPolicyObject(ur kyvernov2.UpdateRequest) (kyvern
 	return npolicyObj, nil
 }
 
-func (c *GenerateController) ApplyGeneratePolicy(log logr.Logger, policyContext *engine.PolicyContext, applicableRules []string) (genResources []kyvernov1.ResourceSpec, err error) {
+func (c *GenerateController) ApplyGeneratePolicy(log logr.Logger, policyContext *engine.PolicyContext, applicableRules []string) (map[string][]kyvernov1.ResourceSpec, error) {
+	genResources := make(map[string][]kyvernov1.ResourceSpec)
 	policy := policyContext.Policy()
 	resource := policyContext.NewResource()
 	// To manage existing resources, we compare the creation time for the default resource to be generated and policy creation time
@@ -345,7 +367,7 @@ func (c *GenerateController) ApplyGeneratePolicy(log logr.Logger, policyContext 
 			return nil, err
 		}
 		ruleNameToProcessingTime[rule.Name] = time.Since(startTime)
-		genResources = append(genResources, genResource...)
+		genResources[rule.Name] = genResource
 		applyCount++
 	}
 
@@ -362,16 +384,20 @@ func NewGenerateControllerWithOnlyClient(client dclient.Interface, engine engine
 }
 
 // GetUnstrResource converts ResourceSpec object to type Unstructured
-func (c *GenerateController) GetUnstrResource(genResourceSpec kyvernov1.ResourceSpec) (*unstructured.Unstructured, error) {
-	resource, err := c.client.GetResource(context.TODO(), genResourceSpec.APIVersion, genResourceSpec.Kind, genResourceSpec.Namespace, genResourceSpec.Name)
-	if err != nil {
-		return nil, err
+func (c *GenerateController) GetUnstrResources(genResourceSpecs []kyvernov1.ResourceSpec) ([]*unstructured.Unstructured, error) {
+	resources := []*unstructured.Unstructured{}
+	for _, genResourceSpec := range genResourceSpecs {
+		resource, err := c.client.GetResource(context.TODO(), genResourceSpec.APIVersion, genResourceSpec.Kind, genResourceSpec.Namespace, genResourceSpec.Name)
+		if err != nil {
+			return nil, err
+		}
+		resources = append(resources, resource)
 	}
-	return resource, nil
+	return resources, nil
 }
 
 func (c *GenerateController) needsReports(trigger unstructured.Unstructured) bool {
-	createReport := true
+	createReport := c.reportsConfig.GenerateReportsEnabled()
 	// check if the resource supports reporting
 	if !reportutils.IsGvkSupported(trigger.GroupVersionKind()) {
 		createReport = false
@@ -385,7 +411,7 @@ func (c *GenerateController) createReports(
 	resource unstructured.Unstructured,
 	engineResponses ...engineapi.EngineResponse,
 ) error {
-	report := reportutils.BuildGenerateReport(resource.GetNamespace(), resource.GetName(), resource.GroupVersionKind(), resource.GetName(), resource.GetUID(), engineResponses...)
+	report := reportutils.BuildGenerateReport(resource.GetNamespace(), resource.GroupVersionKind(), resource.GetName(), resource.GetUID(), engineResponses...)
 	if len(report.GetResults()) > 0 {
 		err := c.reportsBreaker.Do(ctx, func(ctx context.Context) error {
 			_, err := reportutils.CreateReport(ctx, report, c.kyvernoClient)
